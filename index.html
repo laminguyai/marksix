@@ -86,27 +86,7 @@
   }
 
   .tumbler { position: absolute; inset: 0; z-index: 1; }
-  .t-ball {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 26px;
-    height: 26px;
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 11px;
-    font-weight: 700;
-    color: #FFFFFF;
-    text-shadow: 0 1px 1px rgba(0,0,0,0.3);
-    box-shadow: inset 0 -4px 7px rgba(0,0,0,0.22), inset 0 3px 6px rgba(255,255,255,0.35), 0 2px 4px rgba(0,0,0,0.15);
-    will-change: transform;
-  }
-  .t-ball.exiting {
-    transition: transform 0.42s cubic-bezier(0.18, 0.75, 0.28, 1), opacity 0.42s ease-in;
-    opacity: 0;
-  }
+  canvas.tumbler { width: 100%; height: 100%; display: block; }
 
   /* official Mark Six ball colours, shared by all ball sizes */
   .c-red   { background: radial-gradient(circle at 34% 28%, #F08378, var(--red) 58%, #B23027); }
@@ -259,6 +239,17 @@
     color: rgba(232,199,102,0.55);
   }
 
+  #version {
+    position: fixed;
+    right: 12px;
+    bottom: 10px;
+    z-index: 10;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    color: rgba(232,199,102,0.45);
+    pointer-events: none;
+  }
+
   @media (max-width: 420px) {
     .slot { width: 36px; height: 36px; }
     .r-ball { width: 36px; height: 36px; font-size: 13px; }
@@ -284,7 +275,7 @@
   <section class="machine" aria-live="polite">
     <div class="globe-ring">
       <div class="globe">
-        <div class="tumbler" id="tumbler"></div>
+        <canvas class="tumbler" id="tumblerCanvas"></canvas>
       </div>
     </div>
     <div class="base"><span>MARK SIX</span></div>
@@ -300,6 +291,7 @@
   </section>
 
   <footer>★ MARK SIX ★</footer>
+  <div id="version" aria-hidden="true"></div>
 </main>
 
 <script>
@@ -312,8 +304,12 @@
     return "c-green";
   }
 
+  const VERSION = "1.1.0";
+  document.getElementById("version").textContent = "v" + VERSION;
+
   const globe = document.querySelector(".globe");
-  const tumbler = document.getElementById("tumbler");
+  const canvas = document.getElementById("tumblerCanvas");
+  const ctx = canvas.getContext("2d");
   const track = document.getElementById("track");
   const drawBtn = document.getElementById("drawBtn");
   const historySection = document.getElementById("historySection");
@@ -368,12 +364,14 @@
 
   let world = measureWorld();
   let balls = [];
+  let exitingBalls = []; // drawn balls fading down the exit chute
   let phase = "idle"; // idle | refill | roll1 | pause | roll2 | drawing | settling
   let phaseTime = 0;
   let drawCount = 0;
   let busy = false;
   let rafId = 0;
   let lastFrame = 0;
+  let lastFrameDt = 0;
   let accumulator = 0;
   let drawResult = [];
   let mainResult = [];
@@ -386,47 +384,115 @@
   let jetPhase = 0;
   // Sweep-and-prune collision order. The 49 balls stay nearly x-sorted between
   // steps, so an insertion-sort sweep checks only real neighbours instead of
-  // all 1,176 pairs — this is what keeps iPhone Safari at full frame rate.
+  // all 1,176 pairs — cheap even on old phones.
   const sweepOrder = Array.from({ length: 64 }, (_, i) => i);
+  const drawOrder = [];
 
-  function makeBall(num) {
-    const el = document.createElement("div");
-    el.className = "t-ball " + ballColor(num);
-    el.textContent = num;
-    el.setAttribute("aria-hidden", "true");
-    el.style.width = `${world.ballR * 2}px`;
-    el.style.height = `${world.ballR * 2}px`;
-    el.style.fontSize = `${11 * world.scale}px`;
-    return el;
+  // ---- Canvas rendering ----
+  // All 49 balls are drawn into ONE canvas. On iPhone Safari this is vastly
+  // cheaper than 49 composited DOM layers with gradients and shadows.
+  let renderScale = 1;
+  let sprites = null; // colour -> offscreen canvas sprite (gradient baked in)
+
+  function makeSprites() {
+    const r = world.ballR * renderScale;
+    const d = Math.max(2, Math.ceil(r * 2));
+    const stops = {
+      "c-red":   ["#F08378", "#DF4A42", "#B23027"],
+      "c-blue":  ["#7FB0EC", "#2F7BD9", "#1D5BAD"],
+      "c-green": ["#7CCBA0", "#3FA36B", "#2A7A4E"]
+    };
+    sprites = {};
+    for (const key of Object.keys(stops)) {
+      const c = document.createElement("canvas");
+      c.width = c.height = d;
+      const g = c.getContext("2d");
+      // soft contact shadow baked behind the ball (bottom crescent)
+      g.fillStyle = "rgba(0,0,0,0.16)";
+      g.beginPath(); g.arc(d / 2, d / 2 + r * 0.1, r, 0, Math.PI * 2); g.fill();
+      const grad = g.createRadialGradient(d * 0.34, d * 0.28, r * 0.08, d / 2, d / 2, r);
+      grad.addColorStop(0, stops[key][0]);
+      grad.addColorStop(0.58, stops[key][1]);
+      grad.addColorStop(1, stops[key][2]);
+      g.fillStyle = grad;
+      g.beginPath(); g.arc(d / 2, d / 2, r * 0.985, 0, Math.PI * 2); g.fill();
+      // top highlight
+      const hi = g.createRadialGradient(d * 0.34, d * 0.26, 0, d * 0.34, d * 0.26, r * 0.6);
+      hi.addColorStop(0, "rgba(255,255,255,0.5)");
+      hi.addColorStop(1, "rgba(255,255,255,0)");
+      g.fillStyle = hi;
+      g.beginPath(); g.arc(d / 2, d / 2, r * 0.985, 0, Math.PI * 2); g.fill();
+      sprites[key] = c;
+    }
   }
 
-  function placeBall(b) {
-    // Rounded values + cached zIndex avoid needless style writes (repaint cost).
-    b.el.style.transform = `translate3d(${(b.x - world.ballR).toFixed(2)}px, ${(b.y - world.ballR).toFixed(2)}px, 0) rotate(${b.angle.toFixed(3)}rad)`;
-    const z = Math.round(b.y * 10);
-    if (z !== b.lastZ) { b.lastZ = z; b.el.style.zIndex = String(z); }
+  function setupCanvas() {
+    const rect = globe.getBoundingClientRect();
+    // Cap at 2x: visually indistinguishable for shaded circles, ~44% fewer
+    // pixels than 3x on modern iPhones.
+    renderScale = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(rect.width * renderScale);
+    canvas.height = Math.round(rect.height * renderScale);
+    makeSprites();
+  }
+
+  function drawOne(b) {
+    const r = world.ballR;
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    if (b.exit) {
+      const k = Math.min(1, b.exit.t / 0.42);
+      const e = k * k * (3 - 2 * k);
+      ctx.globalAlpha = 1 - e;
+      const s = 1 - 0.88 * e;
+      ctx.translate((world.cx - b.exit.fx) * e, (world.cy + world.wallR - r * 2.1 - b.exit.fy) * e);
+      ctx.scale(s, s);
+    }
+    ctx.rotate(b.angle);
+    const d = r * 2;
+    ctx.drawImage(sprites[b.color], -r, -r, d, d);
+    ctx.font = "700 " + Math.round(11 * world.scale) + "px -apple-system, 'PingFang HK', Arial, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "rgba(0,0,0,0.3)";
+    ctx.fillText(b.num, 0, 0.9 * world.scale);
+    ctx.fillStyle = "#FFFFFF";
+    ctx.fillText(b.num, 0, 0);
+    ctx.restore();
   }
 
   function renderBalls() {
-    for (const b of balls) placeBall(b);
+    if (!sprites) return;
+    ctx.setTransform(renderScale, 0, 0, renderScale, 0, 0);
+    ctx.clearRect(0, 0, world.cx * 2, world.cy * 2);
+    // depth: lower balls (larger y) drawn last
+    drawOrder.length = balls.length;
+    for (let i = 0; i < balls.length; i++) drawOrder[i] = i;
+    for (let i = 1; i < balls.length; i++) {
+      const v = drawOrder[i];
+      const vy = balls[v].y;
+      let j = i - 1;
+      while (j >= 0 && balls[drawOrder[j]].y > vy) { drawOrder[j + 1] = drawOrder[j]; j--; }
+      drawOrder[j + 1] = v;
+    }
+    for (let i = 0; i < balls.length; i++) drawOne(balls[drawOrder[i]]);
+    for (let i = exitingBalls.length - 1; i >= 0; i--) {
+      const b = exitingBalls[i];
+      b.exit.t += lastFrameDt;
+      if (b.exit.t >= 0.46) { exitingBalls.splice(i, 1); continue; }
+      drawOne(b);
+    }
   }
 
   function newBall(num, x, y, sleeping) {
-    const el = makeBall(num);
-    tumbler.appendChild(el);
-    return {
-      el, num, x, y, vx: 0, vy: 0, angle: 0,
-      omega: 0, sleepTime: 0, sleeping: Boolean(sleeping), lastZ: -1
-    };
+    return { num, color: ballColor(num), x, y, vx: 0, vy: 0, angle: 0, omega: 0, sleepTime: 0, sleeping: Boolean(sleeping) };
   }
 
   function initTumbler() {
-    tumbler.replaceChildren();
-    balls = REST_OFFSETS.map(([ox, oy], i) => {
-      const b = newBall(i + 1, world.cx + ox * world.scale, world.cy + oy * world.scale, true);
-      placeBall(b);
-      return b;
-    });
+    exitingBalls.length = 0;
+    balls = REST_OFFSETS.map(([ox, oy], i) =>
+      newBall(i + 1, world.cx + ox * world.scale, world.cy + oy * world.scale, true)
+    );
   }
 
   function rand1to49() { return Math.floor(Math.random() * 49) + 1; }
@@ -605,7 +671,7 @@
   function beginRoundTwo() {
     wakeAll();
     setPhase("roll2");
-    drawBtn.textContent = "第二��…";
+    drawBtn.textContent = "第二轉…";
   }
 
   function spawnRefillBall() {
@@ -617,7 +683,6 @@
     const b = newBall(num, world.cx + feedX, y, false);
     b.vx = ((order % 2) ? 1 : -1) * 3 * world.scale;
     balls.push(b);
-    placeBall(b);
   }
 
   function startRefill(missing) {
@@ -700,14 +765,8 @@
     const index = balls.findIndex(b => b.num === num);
     if (index < 0) return;
     const b = balls.splice(index, 1)[0];
-    b.el.classList.add("exiting");
-    b.el.style.zIndex = "1000";
-    const x = world.cx - world.ballR;
-    const y = world.cy + world.wallR - world.ballR * 2.1;
-    requestAnimationFrame(() => {
-      b.el.style.transform = `translate3d(${x}px, ${y}px, 0) scale(0.12) rotate(${b.angle}rad)`;
-    });
-    setTimeout(() => b.el.remove(), 460);
+    b.exit = { t: 0, fx: b.x, fy: b.y };
+    exitingBalls.push(b);
   }
 
   function beginSettling() {
@@ -831,13 +890,14 @@
     // next paint is never delayed (prevents the dropped-frame cascade).
     const elapsed = Math.min(0.034, Math.max(0, (now - lastFrame) / 1000));
     lastFrame = now;
+    lastFrameDt = elapsed;
     accumulator += elapsed;
     while (accumulator >= FIXED_DT && phase !== "idle") {
       simulate(FIXED_DT);
       accumulator -= FIXED_DT;
     }
     renderBalls();
-    if (phase !== "idle") {
+    if (phase !== "idle" || exitingBalls.length) {
       rafId = requestAnimationFrame(tick);
     } else {
       rafId = 0;
@@ -847,15 +907,14 @@
   }
 
   function completeWithoutMotion() {
+    exitingBalls.length = 0;
     for (const num of drawResult) {
       const index = balls.findIndex(b => b.num === num);
-      if (index >= 0) {
-        balls[index].el.remove();
-        balls.splice(index, 1);
-      }
+      if (index >= 0) balls.splice(index, 1);
     }
     drawResult.forEach((n, i) => fillSlot(i, n));
     addHistory(mainResult, specialResult);
+    renderBalls();
     busy = false;
     drawBtn.disabled = false;
     drawBtn.textContent = "攪 珠";
@@ -864,7 +923,7 @@
   function doDraw() {
     if (busy) return;
     // If the user starts again immediately, discard any still-fading exit balls.
-    tumbler.querySelectorAll(".t-ball.exiting").forEach(el => el.remove());
+    exitingBalls.length = 0;
     busy = true;
     drawBtn.disabled = true;
     drawResult = drawSeven();
@@ -896,16 +955,17 @@
       b.y = world.cy + (b.y - previous.cy) * ratio;
       b.vx *= ratio;
       b.vy *= ratio;
-      b.el.style.width = `${world.ballR * 2}px`;
-      b.el.style.height = `${world.ballR * 2}px`;
-      b.el.style.fontSize = `${11 * world.scale}px`;
     }
+    exitingBalls.length = 0;
+    setupCanvas();
     renderBalls();
   }
 
   window.addEventListener("resize", resizeWorld, { passive: true });
+  setupCanvas();
   renderTrack();
   initTumbler(); // All 49 balls begin in a genuinely still, settled pile.
+  renderBalls();
   drawBtn.addEventListener("click", doDraw);
 </script>
 </body>
